@@ -1,7 +1,9 @@
 /**
  * Markdown-based memory storage for pi-hindsight.
- * Stores learned patterns as \u00a7-delimited entries in MEMORY.md,
- * matching Hermes Agent's memory format. Human-readable, git-friendly.
+ *
+ * Two-tier memory matching Hermes Agent:
+ *   MEMORY.md  — LLM-learned patterns (confidence varies, curator cleans)
+ *   USER.md    — User-stated preferences (confidence=1.0, permanent)
  */
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -26,10 +28,14 @@ export interface MemoryEntry {
   createdAt: string;
   lastApplied: string | null;
   source: string;
+  /** true if from USER.md — user-stated, never auto-cleaned */
+  userStated: boolean;
 }
 
 export interface MemoryStats {
   total: number;
+  memoryCount: number;
+  userCount: number;
   byType: Record<string, number>;
   avgConfidence: number;
   highestConfidence: number;
@@ -44,23 +50,28 @@ function getStoreDir(): string {
   return join(agentDir, "extensions", "hindsight");
 }
 
-function getMemoryPath(): string {
+export function getMemoryPath(): string {
   return join(getStoreDir(), "MEMORY.md");
+}
+
+export function getUserPath(): string {
+  return join(getStoreDir(), "USER.md");
 }
 
 // ---------------------------------------------------------------------------
 // Serialization
 // ---------------------------------------------------------------------------
 
-function serializeEntry(e: MemoryEntry): string {
+function serializeEntry(e: MemoryEntry, includeUserField: boolean): string {
   const lines = [
     `\u00a7 ${e.id}`,
     `type: ${e.type}`,
-    `confidence: ${e.confidence}`,
+    `confidence: ${e.userStated ? 1.0 : e.confidence}`,
     `tags: [${e.tags.join(", ")}]`,
     `created: ${e.createdAt}`,
     e.lastApplied ? `applied: ${e.lastApplied}` : null,
     `source: ${e.source}`,
+    includeUserField ? `user-stated: ${e.userStated}` : null,
     `---`,
     e.body,
     "",
@@ -82,104 +93,161 @@ function parseChunks(text: string): MemoryEntry[] {
     let bodyStart = -1;
     for (let i = 1; i < lines.length; i++) {
       if (lines[i]!.trim() === "---") { bodyStart = i + 1; break; }
-      const m = lines[i]!.match(/^(\w+):\s*(.+)$/);
+      const m = lines[i]!.match(/^(\w[\w-]*):\s*(.+)$/);
       if (m) meta[m[1]!] = m[2]!.trim();
     }
     const body = bodyStart > 0 ? lines.slice(bodyStart).join("\n").trim() : "";
     const c = parseFloat(meta.confidence ?? "0.5");
+    const userStated = meta["user-stated"] === "true";
     entries.push({
-      id, type: (meta.type as PatternType) ?? "effective-strategy",
-      summary: body.split("\n")[0]?.slice(0, 120) ?? "", body,
-      tags: (meta.tags ?? "[]").replace(/^\[|\]$/g, "").split(",").map(t => t.trim()).filter(Boolean),
-      confidence: isNaN(c) ? 0.5 : c,
+      id,
+      type: (meta.type as PatternType) ?? "effective-strategy",
+      summary: body.split("\n")[0]?.slice(0, 120) ?? "",
+      body,
+      tags: (meta.tags ?? "[]").replace(/^\[|\]$/g, "").split(",").map((t) => t.trim()).filter(Boolean),
+      confidence: userStated ? 1.0 : isNaN(c) ? 0.5 : c,
       successCount: parseInt(meta.successCount ?? "0", 10) || 0,
       failCount: parseInt(meta.failCount ?? "0", 10) || 0,
       context: meta.context ?? "",
       createdAt: meta.created ?? new Date().toISOString(),
       lastApplied: meta.applied ?? null,
-      source: meta.source ?? "unknown",
+      source: meta.source ?? (userStated ? "user" : "unknown"),
+      userStated,
     });
   }
   return entries;
 }
 
 // ---------------------------------------------------------------------------
-// CRUD
+// File-level operations
 // ---------------------------------------------------------------------------
 
-export async function loadAll(): Promise<MemoryEntry[]> {
+async function readEntries(path: string): Promise<MemoryEntry[]> {
   try {
-    return parseChunks(await readFile(getMemoryPath(), "utf-8"));
+    return parseChunks(await readFile(path, "utf-8"));
   } catch {
     return [];
   }
 }
 
-export async function saveAll(entries: MemoryEntry[]): Promise<void> {
+async function writeEntries(path: string, entries: MemoryEntry[]): Promise<void> {
   const dir = getStoreDir();
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  await writeFile(getMemoryPath(), entries.map(serializeEntry).join("\n") + "\n", "utf-8");
+  // USER.md stores userStated=false entries too for simplicity
+  const content = entries.map((e) => serializeEntry(e, true)).join("\n") + "\n";
+  await writeFile(path, content, "utf-8");
 }
 
-export async function addEntry(entry: MemoryEntry): Promise<MemoryEntry[]> {
-  const entries = await loadAll();
-  const firstLine = entry.body.split("\n")[0]?.trim().toLowerCase() ?? "";
-  const idx = entries.findIndex(
-    (e) => e.type === entry.type && e.body.split("\n")[0]?.trim().toLowerCase() === firstLine,
-  );
-  if (idx >= 0) {
-    const cur = entries[idx]!;
-    if (entry.confidence > cur.confidence) cur.confidence = entry.confidence;
-    cur.successCount += entry.successCount;
-    cur.failCount += entry.failCount;
-    cur.lastApplied = new Date().toISOString();
-    if (entry.body.length > cur.body.length) cur.body = entry.body;
-    entries[idx] = cur;
+// ---------------------------------------------------------------------------
+// CRUD
+// ---------------------------------------------------------------------------
+
+export async function loadAll(): Promise<{
+  memory: MemoryEntry[];
+  user: MemoryEntry[];
+  all: MemoryEntry[];
+}> {
+  const memory = await readEntries(getMemoryPath());
+  const user = await readEntries(getUserPath());
+  return {
+    memory,
+    user,
+    all: [...user, ...memory],
+  };
+}
+
+export async function saveMemoryEntry(entry: MemoryEntry): Promise<void> {
+  const { memory, user } = await loadAll();
+  if (entry.userStated) {
+    user.push(entry);
+    await writeEntries(getUserPath(), user);
   } else {
-    entries.push(entry);
+    // Deduplicate by type + first line
+    const first = entry.body.split("\n")[0]?.trim().toLowerCase() ?? "";
+    const idx = memory.findIndex(
+      (e) => !e.userStated && e.type === entry.type && e.body.split("\n")[0]?.trim().toLowerCase() === first,
+    );
+    if (idx >= 0) {
+      const cur = memory[idx]!;
+      if (entry.confidence > cur.confidence) cur.confidence = entry.confidence;
+      cur.successCount += entry.successCount;
+      cur.failCount += entry.failCount;
+      cur.lastApplied = new Date().toISOString();
+      if (entry.body.length > cur.body.length) cur.body = entry.body;
+      memory[idx] = cur;
+    } else {
+      memory.push(entry);
+    }
+    memory.sort((a, b) => b.confidence - a.confidence || b.createdAt.localeCompare(a.createdAt));
+    if (memory.length > 100) memory.splice(100);
+    await writeEntries(getMemoryPath(), memory);
   }
-  entries.sort((a, b) => b.confidence - a.confidence || b.createdAt.localeCompare(a.createdAt));
-  if (entries.length > 100) entries.splice(100);
-  await saveAll(entries);
-  return entries;
-}
-
-export async function deleteEntry(id: string): Promise<boolean> {
-  const entries = await loadAll();
-  const before = entries.length;
-  const filtered = entries.filter((e) => e.id !== id);
-  if (filtered.length !== before) {
-    await saveAll(filtered);
-    return true;
-  }
-  return false;
 }
 
 export async function queryRelevant(context: string, minConfidence = 0.3): Promise<MemoryEntry[]> {
-  const entries = await loadAll();
+  const { all } = await loadAll();
   const ctx = context.toLowerCase();
-  return entries.filter((e) => {
-    if (e.confidence < minConfidence) return false;
+  return all.filter((e) => {
+    const conf = e.userStated ? 1.0 : e.confidence;
+    if (conf < minConfidence) return false;
     if (!ctx) return true;
     return e.body.toLowerCase().includes(ctx) || e.tags.some((t) => t.toLowerCase().includes(ctx));
   });
 }
 
 export async function getStats(): Promise<MemoryStats> {
-  const entries = await loadAll();
+  const { memory, user, all } = await loadAll();
   const byType: Record<string, number> = {};
   let totalConf = 0;
   let highest = 0;
-  for (const e of entries) {
+  for (const e of all) {
     byType[e.type] = (byType[e.type] ?? 0) + 1;
-    totalConf += e.confidence;
+    totalConf += e.userStated ? 1.0 : e.confidence;
     if (e.confidence > highest) highest = e.confidence;
   }
   return {
-    total: entries.length, byType,
-    avgConfidence: entries.length > 0 ? totalConf / entries.length : 0,
+    total: all.length,
+    memoryCount: memory.length,
+    userCount: user.length,
+    byType,
+    avgConfidence: all.length > 0 ? totalConf / all.length : 0,
     highestConfidence: highest,
   };
+}
+
+export async function addUserPreference(body: string, tags: string[]): Promise<MemoryEntry> {
+  const entry: MemoryEntry = {
+    id: `user_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    type: "preference",
+    summary: body.split("\n")[0]?.slice(0, 120) ?? body.slice(0, 120),
+    body,
+    tags,
+    confidence: 1.0,
+    successCount: 0, failCount: 0, context: "",
+    createdAt: new Date().toISOString(),
+    lastApplied: new Date().toISOString(),
+    source: "user",
+    userStated: true,
+  };
+  await saveMemoryEntry(entry);
+  return entry;
+}
+
+export async function deleteEntry(id: string): Promise<boolean> {
+  const { memory, user } = await loadAll();
+  const memBefore = memory.length;
+  const userBefore = user.length;
+  const newMem = memory.filter((e) => e.id !== id);
+  const newUser = user.filter((e) => e.id !== id);
+  if (newMem.length !== memBefore) {
+    await writeEntries(getMemoryPath(), newMem);
+    return true;
+  }
+  if (newUser.length !== userBefore) {
+    await writeEntries(getUserPath(), newUser);
+    return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,25 +256,40 @@ export async function getStats(): Promise<MemoryStats> {
 
 export function formatAsPrompt(entries: MemoryEntry[], max = 5): string {
   if (entries.length === 0) return "";
-  const lines = entries.slice(0, max).map((e, i) =>
-    `${i + 1}. [${(e.confidence * 100).toFixed(0)}%] ${e.body.split("\n")[0] ?? e.summary}`,
-  );
-  return ["", "---", "## Hindsight (learned from past sessions)",
-    "The following patterns were learned from previous work. Consider them when relevant.",
-    ...lines, "---", "",
+  // User preferences first, then by confidence
+  const sorted = [...entries].sort((a, b) => {
+    if (a.userStated && !b.userStated) return -1;
+    if (!a.userStated && b.userStated) return 1;
+    return b.confidence - a.confidence;
+  });
+  const lines = sorted.slice(0, max).map((e, i) => {
+    const prefix = e.userStated ? "[USER]" : `[${(e.confidence * 100).toFixed(0)}%]`;
+    const first = e.body.split("\n")[0] ?? e.summary;
+    return `${i + 1}. ${prefix} ${first}`;
+  });
+  return [
+    "",
+    "---",
+    "## Hindsight (learned patterns + user preferences)",
+    "[USER] = user-stated preference (fixed). [XX%] = learned pattern (confidence).",
+    ...lines,
+    "---",
+    "",
   ].join("\n");
 }
 
-export function buildReflectionPrompt(turnSummary: string): string {
-  return `## Background Self-Improvement Review
+export function buildReflectionPrompt(summary: string): string {
+  return `You are a self-improvement reviewer. Analyze the following conversation turn.
 
-Review the conversation above. Identify if there\'s anything worth remembering:
-- Effective strategy or workflow to repeat?
-- Mistake or anti-pattern to avoid?
-- User preference to record?
-- Recurring error pattern?
+${summary}
 
-If you find something worth remembering, call the \`learn_pattern\` tool to save it.
-Be selective \u2014 only save high-value, reusable patterns.
-If nothing is worth remembering, do nothing.`;
+Review criteria:
+- Effective strategy or workflow worth remembering? \u2192 call \`learn_pattern\`
+- Mistake or anti-pattern to avoid? \u2192 call \`learn_pattern\`
+- User stated a clear preference? \u2192 also call \`learn_pattern\` with type=preference
+- Nothing notable? \u2192 do nothing
+
+Be selective. Only save high-value, reusable patterns.
+
+IMPORTANT: If the user explicitly stated a preference (\"I always do X\", \"Use Y not Z\", etc.), save it as type=preference so it goes to USER.md automatically.`;
 }
