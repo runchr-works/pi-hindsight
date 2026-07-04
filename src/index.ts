@@ -1,13 +1,16 @@
 /**
  * pi-hindsight — Self-learning extension for Pi coding agent.
  *
+ * Hermes-level self-learning:
+ * - Markdown memory store (~/.pi/agent/extensions/hindsight/MEMORY.md)
+ * - Agent-initiated learning via learn_pattern/recall tools
+ * - Automatic reflection after each session
+ * - Relevant context injection before each task
+ *
  * Installation:
  *   pi install /path/to/pi-hindsight
- *   # or:  pi install npm:pi-hindsight
  *
- * Learns from past agent sessions and injects relevant lessons
- * into future prompts. Patterns are stored in JSON at:
- *   ~/.pi/agent/extensions/hindsight/patterns.json
+ * File: ~/.pi/agent/extensions/hindsight/MEMORY.md
  */
 
 import type { ExtensionAPI } from "./pi-api.js";

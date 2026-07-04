@@ -1,68 +1,46 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, BeforeAgentStartEvent, BeforeAgentStartEventResult, AgentEndEvent, TurnEndEvent, AgentMessage, ToolResultMessage, ExtensionCommandContext } from "./pi-api.js";
-import type { HindsightPattern, HindsightConfig } from "./patterns.js";
-import { loadStore, saveStore, addPattern, getRelevantPatterns, formatPatternsAsPrompt } from "./store.js";
+import type {
+  ExtensionAPI, AgentMessage,
+  BeforeAgentStartEvent, BeforeAgentStartEventResult,
+  AgentEndEvent, TurnEndEvent,
+} from "./pi-api.js";
+import type { MemoryEntry } from "./memory.js";
+import {
+  loadAll, saveAll, addEntry, queryRelevant,
+  formatAsPrompt, buildReflectionPrompt, getStats,
+} from "./memory.js";
+import { buildLearnPatternTool, buildRecallTool } from "./tools.js";
 
 // ---------------------------------------------------------------------------
-// In-memory session tracking
+// State
 // ---------------------------------------------------------------------------
 
-interface SessionInfo {
-  startTime: number;
-  taskDescription: string;
-  turnCount: number;
-  errors: string[];
-}
-
-let currentSession: SessionInfo | null = null;
-let config: HindsightConfig = { maxPatterns: 100, minConfidence: 0.3, autoInject: true };
+let reflectionEnabled = true;
+let sessionTask = "";
+let turnMessages: string[] = [];
 
 // ---------------------------------------------------------------------------
-// Heuristics
+// Helpers
 // ---------------------------------------------------------------------------
 
 function extractContext(messages: AgentMessage[]): string {
-  for (const msg of messages) {
-    if (msg.role === "user") {
-      const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
-      const extMatch = text.match(/\.(\w+)\b/g);
-      if (extMatch) return extMatch.slice(0, 5).join(", ");
+  for (const m of messages) {
+    if (m.role === "user") {
+      const t = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      const ex = t.match(/\.(\w+)\b/g);
+      if (ex) return ex.slice(0, 5).join(", ");
     }
   }
   return "";
 }
 
-function classifyTurn(toolResults: ToolResultMessage[], context: string): HindsightPattern | null {
-  const errors = toolResults.filter((r) => r.isError);
-  let summary = "";
-  let type: HindsightPattern["type"] = "effective-strategy";
-  let confidence = 0.5;
+function summarizeTurn(msg: AgentMessage): string {
+  const c = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content);
+  return c.slice(0, 1000);
+}
 
-  if (errors.length > 0) {
-    type = "common-error";
-    summary = `Turn had ${errors.length} error(s)`;
-    confidence = 0.6;
-  } else if (toolResults.length > 0 && toolResults.length < 5) {
-    summary = "Completed task efficiently with minimal tool calls";
-    type = "effective-strategy";
-    confidence = 0.5;
-  }
-
-  if (!summary) return null;
-
-  return {
-    id: `hint_${randomUUID().slice(0, 12)}`,
-    type, summary,
-    detail: `${toolResults.length} tool calls, ${errors.length} errors`,
-    tags: type === "common-error" ? ["error"] : ["strategy"],
-    confidence,
-    successCount: errors.length === 0 ? 1 : 0,
-    failCount: errors.length > 0 ? 1 : 0,
-    context,
-    createdAt: new Date().toISOString(),
-    lastApplied: null,
-    sourceSession: currentSession?.taskDescription ?? "unknown",
-  };
+function entryId(): string {
+  return `hint_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,102 +48,138 @@ function classifyTurn(toolResults: ToolResultMessage[], context: string): Hindsi
 // ---------------------------------------------------------------------------
 
 export function setupHandlers(pi: ExtensionAPI): void {
-  // Inject learned patterns into system prompt
+  // ─── Session start: load memory ───
+  pi.on("session_start", async () => {
+    turnMessages = [];
+    sessionTask = "";
+  });
+
+  // ─── Before agent start: inject hindsight context ───
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent): Promise<BeforeAgentStartEventResult | undefined> => {
-    if (!config.autoInject) return undefined;
-    currentSession = { startTime: Date.now(), taskDescription: event.prompt.slice(0, 100), turnCount: 0, errors: [] };
-    const relevant = await getRelevantPatterns(event.prompt.slice(0, 200), config.minConfidence);
+    sessionTask = event.prompt.slice(0, 200);
+    turnMessages = [];
+
+    const relevant = await queryRelevant(event.prompt.slice(0, 300));
     if (relevant.length === 0) return undefined;
-    return { systemPrompt: event.systemPrompt + formatPatternsAsPrompt(relevant) };
+
+    return { systemPrompt: event.systemPrompt + formatAsPrompt(relevant) };
   });
 
-  // Per-turn learning
+  // ─── Turn end: accumulate messages ───
   pi.on("turn_end", async (event: TurnEndEvent) => {
-    if (!currentSession) return;
-    currentSession.turnCount++;
-    for (const r of event.toolResults) {
-      if (r.isError) currentSession.errors.push(String(r.content ?? ""));
-    }
-    const pattern = classifyTurn(event.toolResults, extractContext([event.message]));
-    if (pattern) await addPattern(pattern);
+    turnMessages.push(summarizeTurn(event.message));
   });
 
-  // Session-level learning
+  // ─── Agent end: auto-reflection (Hermes-style) ───
   pi.on("agent_end", async (event: AgentEndEvent) => {
-    if (!currentSession) return;
-    if (currentSession.turnCount > 3 && currentSession.errors.length === 0) {
-      await addPattern({
-        id: `hint_${randomUUID().slice(0, 12)}`,
+    if (!reflectionEnabled || turnMessages.length === 0) return;
+
+    // Build reflection prompt and let the agent process it
+    const context = extractContext(event.messages);
+    const reflectionPrompt = buildReflectionPrompt(turnMessages.join("\n"));
+
+    // Send as background reflection turn
+    pi.sendUserMessage(reflectionPrompt, { deliverAs: "followUp" });
+
+    // Also extract session-level insight
+    const errors = event.messages.filter(m => m.role === "tool").length > 3;
+    if (!errors && turnMessages.length > 3) {
+      await addEntry({
+        id: entryId(),
         type: "workflow",
-        summary: `Completed ${currentSession.turnCount}-turn task without errors`,
-        detail: "Reliable multi-turn workflow pattern",
-        tags: ["workflow", "reliable"],
-        confidence: Math.min(0.7, 0.3 + currentSession.turnCount * 0.1),
+        summary: `Completed ${turnMessages.length}-turn task successfully`,
+        body: `Completed ${turnMessages.length} turns without critical errors. Session context: ${context || "general"}`,
+        tags: ["workflow"],
+        confidence: 0.5,
         successCount: 1, failCount: 0,
-        context: extractContext(event.messages),
+        context,
         createdAt: new Date().toISOString(),
         lastApplied: null,
-        sourceSession: currentSession.taskDescription,
+        source: sessionTask.slice(0, 100),
       });
     }
-    currentSession = null;
   });
 
-  // /hindsight command
+  // ─── Register learn_pattern tool (agent-initiated learning) ───
+  pi.registerTool(buildLearnPatternTool());
+
+  // ─── Register recall tool (agent-initiated recall) ───
+  pi.registerTool(buildRecallTool());
+
+  // ─── Register /hindsight command ───
   pi.registerCommand("hindsight", {
-    description: "Show learned patterns. Usage: /hindsight [list|stats|clear]",
-    handler: async (cmdCtx: ExtensionCommandContext) => {
-      const args = (cmdCtx.args ?? "").trim();
+    description: "View learned patterns: /hindsight, /hindsight stats, /hindsight clear",
+    handler: async (ctx) => {
+      const args = (ctx.args ?? "").trim();
+
       if (args === "stats") {
-        const store = await loadStore();
-        const byType: Record<string, number> = {};
-        for (const p of store.patterns) byType[p.type] = (byType[p.type] ?? 0) + 1;
-        const lines = Object.entries(byType).map(([t, c]) => `  ${t}: ${c}`).join("\n");
-        const avg = store.patterns.length ? (store.patterns.reduce((s, p) => s + p.confidence, 0) / store.patterns.length * 100).toFixed(0) : "0";
-        pi.sendMessage({ customType: "hindsight", content: `Stats\nPatterns: ${store.patterns.length}\nAvg confidence: ${avg}%\n\n${lines}`, display: "stats" });
+        const stats = await getStats();
+        const byType = Object.entries(stats.byType)
+          .map(([t, c]) => `  ${t}: ${c}`).join("\n");
+        pi.sendMessage({
+          customType: "hindsight",
+          content: `MEMORY.md Stats\nTotal entries: ${stats.total}\nAvg confidence: ${(stats.avgConfidence * 100).toFixed(0)}%\n\n${byType}`,
+          display: "stats",
+        });
       } else if (args === "clear") {
-        const store = await loadStore();
-        store.patterns = [];
-        await saveStore(store);
-        pi.sendMessage({ customType: "hindsight", content: "All patterns cleared.", display: "clear" });
+        await saveAll([]);
+        pi.sendMessage({ customType: "hindsight", content: "MEMORY.md cleared.", display: "clear" });
+      } else if (args === "path") {
+        const { homedir } = await import("node:os");
+        const { join } = await import("node:path");
+        const dir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+        pi.sendMessage({ customType: "hindsight", content: `MEMORY.md: ${dir}/extensions/hindsight/MEMORY.md`, display: "path" });
       } else {
-        const store = await loadStore();
-        if (store.patterns.length === 0) {
-          pi.sendMessage({ customType: "hindsight", content: "No patterns yet.", display: "list" });
+        const entries = await loadAll();
+        if (entries.length === 0) {
+          pi.sendMessage({
+            customType: "hindsight",
+            content: "MEMORY.md is empty. Patterns are learned automatically when you use pi. Try: /hindsight stats, /hindsight path",
+            display: "list",
+          });
           return;
         }
-        const lines = store.patterns.slice(0, 20).map((p, i) => `${i + 1}. [${(p.confidence * 100).toFixed(0)}%] ${p.type}: ${p.summary}`);
-        pi.sendMessage({ customType: "hindsight", content: `Patterns (${store.patterns.length} total)\n\n${lines.join("\n")}`, display: "list" });
+        const lines = entries.slice(0, 15).map((e, i) => {
+          const first = e.body.split("\n")[0] ?? "";
+          return `${i + 1}. [${(e.confidence * 100).toFixed(0)}%] ${e.type}: ${first.slice(0, 80)}`;
+        });
+        pi.sendMessage({
+          customType: "hindsight",
+          content: `MEMORY.md entries (${entries.length} total)\n\n${lines.join("\n")}\n\n/hindsight stats | /hindsight path | /hindsight clear`,
+          display: "list",
+        });
       }
     },
   });
 
-  // /forget command
+  // ─── Register /forget command ───
   pi.registerCommand("forget", {
     description: "Remove a pattern by ID or number. Usage: /forget <id|#>",
-    handler: async (cmdCtx: ExtensionCommandContext) => {
-      const target = (cmdCtx.args ?? "").trim();
+    handler: async (ctx) => {
+      const target = (ctx.args ?? "").trim();
       if (!target) {
         pi.sendMessage({ customType: "hindsight", content: "Usage: /forget <pattern-id> or /forget <number>", display: "help" });
         return;
       }
-      const store = await loadStore();
-      const byId = store.patterns.find((p) => p.id === target);
+      const entries = await loadAll();
+      const byId = entries.find(e => e.id === target);
       if (byId) {
-        store.patterns = store.patterns.filter((p) => p.id !== target);
-        await saveStore(store);
-        pi.sendMessage({ customType: "hindsight", content: `Forgotten: "${byId.summary}"`, display: "forget" });
+        await addEntry({ ...byId, confidence: -1 } as any);
+        // Actually delete:
+        const updated = entries.filter(e => e.id !== target);
+        await saveAll(updated);
+        pi.sendMessage({ customType: "hindsight", content: `Forgotten: "${byId.summary.slice(0, 60)}"`, display: "forget" });
         return;
       }
       const num = parseInt(target, 10);
-      if (!isNaN(num) && num > 0 && num <= store.patterns.length) {
-        const pattern = store.patterns[num - 1]!;
-        store.patterns = store.patterns.filter((p) => p.id !== pattern.id);
-        await saveStore(store);
-        pi.sendMessage({ customType: "hindsight", content: `Forgotten: "${pattern.summary}"`, display: "forget" });
+      if (!isNaN(num) && num > 0 && num <= entries.length) {
+        const e = entries[num - 1]!;
+        const updated = entries.filter(x => x.id !== e.id);
+        await saveAll(updated);
+        pi.sendMessage({ customType: "hindsight", content: `Forgotten: "${e.summary.slice(0, 60)}"`, display: "forget" });
         return;
       }
-      pi.sendMessage({ customType: "hindsight", content: `Pattern not found: "${target}"`, display: "error" });
+      pi.sendMessage({ customType: "hindsight", content: `Not found: "${target}"`, display: "error" });
     },
   });
 }
