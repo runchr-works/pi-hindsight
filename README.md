@@ -1,28 +1,29 @@
-# pi-hindsight 🧠
+# pi-hindsight \ud83e\udde0
 
 Self-learning extension for [Pi coding agent](https://github.com/badlogic/pi-mono).
 
-**Inspired by Hermes Agent's self-improvement loop.** Learns from past sessions,
-injects relevant lessons into future prompts, and lets the agent explicitly save
-and recall knowledge during a session.
+**Inspired by Hermes Agent's self-improvement loop.** After each session, forks
+Pi in the background to review what happened and save patterns. Injects relevant
+patterns before each task so Pi gets better the more you use it.
 
 ## How it works
 
 ```
-You: pi "Refactor the auth module"
+You: pi \"Refactor the auth module\"
+  \u2192
+  \u251c [before_agent_start] Hindsight injects relevant patterns from MEMORY.md
+  \u251c Agent works on task, can call learn_pattern / recall tools
+  \u2514 [agent_end] Forked Pi reviews session in background (user sees nothing)
+        \u2192 Calls learn_pattern if it finds something worth remembering
+        \u2192 Patterns saved to ~/.pi/agent/extensions/hindsight/MEMORY.md
+```
 
-  → [before_agent_start] Hindsight injects relevant past patterns
-     into the system prompt from MEMORY.md
+The background fork uses Pi's own provider and model configuration. You can
+set a specific provider/model for reflection (cheaper model recommended):
 
-  → Agent works on the task, can call:
-     • learn_pattern — explicitly save what it learned
-     • recall       — query past patterns during a session
-
-  → [agent_end] Auto-reflection: agent reviews the session
-     and saves any additional patterns it discovers
-
-  → All patterns stored in ~/.pi/agent/extensions/hindsight/MEMORY.md
-    (plain markdown, readable & editable with any text editor)
+```
+/hindsight config set-provider openai
+/hindsight config set-model gpt-4o-mini
 ```
 
 ## Installation
@@ -35,15 +36,14 @@ pi install /path/to/pi-hindsight
 
 ## Storage
 
-Patterns are stored in **markdown format** at:
+Patterns stored in **markdown format** at:
 ```
 ~/.pi/agent/extensions/hindsight/MEMORY.md
 ```
 
-Each entry is a §-delimited chunk:
-
+Each entry is a \u00a7-delimited chunk. Editable with any text editor:
 ```
-§ hint_abc123
+\u00a7 hint_abc123
 type: effective-strategy
 confidence: 0.8
 tags: [refactoring, testing]
@@ -53,39 +53,49 @@ source: Refactored auth module
 Run tests first, then refactor, then verify with tests again.
 ```
 
-You can edit this file directly with any text editor. Changes take effect
-on the next `before_agent_start` injection.
-
 ## Tools (agent-callable)
 
 | Tool | Description |
 |------|-------------|
-| `learn_pattern` | Agent saves a pattern it discovered during work |
-| `recall` | Agent queries past patterns relevant to current task |
+| \`learn_pattern\` | Save a pattern the agent discovered during work |
+| \`recall\` | Query past patterns relevant to current task |
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `/hindsight` | List all patterns |
-| `/hindsight stats` | Pattern statistics by type |
-| `/hindsight path` | Show MEMORY.md location |
-| `/hindsight clear` | Delete all patterns |
-| `/forget <id|#>` | Remove a specific pattern |
+| \`/hindsight\` | List all patterns |
+| \`/hindsight stats\` | Pattern statistics by type |
+| \`/hindsight path\` | Show MEMORY.md location |
+| \`/hindsight clear\` | Delete all patterns |
+| \`/hindsight config\` | Show reflection config |
+| \`/hindsight config set-provider <name>\` | Set provider for reflection (e.g. \`openai\`) |
+| \`/hindsight config set-model <model>\` | Set model for reflection (e.g. \`gpt-4o-mini\`) |
+| \`/hindsight config toggle\` | Enable/disable auto-reflection |
+| \`/forget <id|#>\` | Remove a specific pattern |
 
-## Architecture
+## Architecture vs Hermes Agent
 
 ```
 Hermes Agent                    pi-hindsight
-══════════════════              ══════════════════
-background_review.py     →      agent_end + sendUserMessage(reflection)
-learning_graph.py        →      MEMORY.md (§-delimited markdown)
-learn_prompt.py          →      learn_pattern tool
-MEMORY.md / USER.md      →      ~/.pi/agent/extensions/hindsight/MEMORY.md
-build_system_prompt()    →      before_agent_start → systemPrompt injection
+\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550              \u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+background_review.py     \u2192      pi.exec(\"pi -p reflection --no-builtin-tools\")
+(fork agent + daemon thread)    (fork Pi in non-interactive mode)
+learning_graph.py        \u2192      MEMORY.md (\u00a7-delimited markdown)
+learn_prompt.py          \u2192      learn_pattern tool
+MEMORY.md / USER.md      \u2192      ~/.pi/agent/extensions/hindsight/MEMORY.md
+build_system_prompt()    \u2192      before_agent_start systemPrompt injection
+MemoryProvider plugin    \u2192      memory.ts (markdown CRUD)
 ```
+
+## Key difference from v0.1
+
+- \u274c JSON storage \u2192 \u2705 Markdown MEMORY.md (human-readable, git-friendly)
+- \u274c Heuristic if/else learning \u2192 \u2705 LLM-powered reflection via forked Pi
+- \u274c Visible sendUserMessage \u2192 \u2705 Invisible pi.exec() background fork
+- \u274c No tool support \u2192 \u2705 learn_pattern / recall tools for agent
+- \u274c No config \u2192 \u2705 Configurable provider/model for reflection
 
 ## License
 
 MIT
-
