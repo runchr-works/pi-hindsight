@@ -5,85 +5,106 @@ import type {
 } from "./pi-api.js";
 import {
   loadAll, saveMemoryEntry, queryRelevant,
-  formatAsPrompt, getStats, getUserPath,
-  deleteEntry, MemoryEntry, getMemoryPath,
+  formatAsPrompt, getStats, getUserPath, getMemoryPath,
+  deleteEntry,
   COMBINED_REVIEW_PROMPT, summarizeReviewActions,
 } from "./memory.js";
 import { loadConfig, saveConfig, buildProviderArgs } from "./config.js";
 
 let sessionMessages: AgentMessage[] = [];
+let sessionSystemPrompt = "";
 let config: Awaited<ReturnType<typeof loadConfig>> | null = null;
 
-function messagesToText(msgs: AgentMessage[]): string {
-  return msgs
-    .map((m) => {
-      const role = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool";
-      const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-      return `[${role}] ${c.slice(0, 800)}`;
-    })
-    .join("\n\n");
+function formatMessages(msgs: AgentMessage[]): string {
+  return msgs.map((m) => {
+    const role = m.role === "user" ? "User" : m.role === "assistant" ? "Assistant" : "Tool";
+    const c = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+    return `<${role}>\n${c}`;
+  }).join("\n\n");
+}
+
+// Skip reflection on trivial turns to save cost
+function isTrivialTurn(msg: AgentMessage): boolean {
+  const c = typeof msg.content === "string" ? msg.content.trim() : "";
+  if (!c || c.length < 10) return true;
+  const trivial = ["ok", "got it", "done", "yes", "no", "sure", "👍", "✅"];
+  return trivial.some((t) => c.toLowerCase() === t || c.toLowerCase().startsWith(t));
+}
+
+// Warm cache: build reflection prompt using the same system prefix
+function buildReviewPrompt(conversationText: string): string {
+  return `${sessionSystemPrompt}\n\n---\n\n${COMBINED_REVIEW_PROMPT}\n\n---\n\n${conversationText}`;
+}
+
+async function fireReflection(pi: ExtensionAPI, prompt: string): Promise<void> {
+  const piArgs = ["-p", prompt, "--no-builtin-tools"];
+  if (config) piArgs.push(...buildProviderArgs(config));
+  try {
+    const result = await pi.exec("pi", piArgs, {
+      env: { ...process.env as any, PI_HINDSIGHT_SKIP_REFLECTION: "1" },
+    });
+    if (result.exitCode === 0 && result.stdout.trim()) {
+      const actions = summarizeReviewActions(result.stdout.trim());
+      if (actions.length > 0) {
+        pi.sendMessage({
+          customType: "hindsight",
+          content: `\ud83d\udcbe Self-improvement review: ${actions.map((a) => a.summary).join(" \u00b7 ")}`,
+          display: "review",
+        });
+      }
+    }
+  } catch {
+    // reflection failed silently
+  }
 }
 
 export function setupHandlers(pi: ExtensionAPI): void {
   loadConfig().then((c) => { config = c; });
-
   if (process.env.PI_HINDSIGHT_SKIP_REFLECTION === "1") return;
 
-  pi.on("session_start", async () => { sessionMessages = []; });
+  pi.on("session_start", async () => {
+    sessionMessages = [];
+    sessionSystemPrompt = "";
+  });
 
   pi.on("before_agent_start", async (event: BeforeAgentStartEvent): Promise<BeforeAgentStartEventResult | undefined> => {
     if (config?.autoReflect === false) return undefined;
     sessionMessages = [];
+    // Store system prompt for warm cache in review forks
+    sessionSystemPrompt = event.systemPrompt;
     const relevant = await queryRelevant(event.prompt.slice(0, 300), config?.minConfidence ?? 0.3);
     if (relevant.length === 0) return undefined;
     return { systemPrompt: event.systemPrompt + formatAsPrompt(relevant) };
   });
 
+  // ─── Per-turn review (Hermes-style) ───
   pi.on("turn_end", async (event: TurnEndEvent) => {
+    if (config?.autoReflect === false) return;
     sessionMessages.push(event.message);
+
+    // Skip trivial turns to save cost
+    if (isTrivialTurn(event.message)) return;
+
+    // Full conversation context — no truncation
+    const conversationText = formatMessages(sessionMessages);
+    const prompt = buildReviewPrompt(conversationText);
+
+    // Fire-and-forget (non-blocking)
+    fireReflection(pi, prompt);
   });
 
-  // ─── Agent end: Hermes-style background review ───
+  // ─── Session-end review (catch anything missed) ───
   pi.on("agent_end", async (event: AgentEndEvent) => {
     if (config?.autoReflect === false) return;
-
-    const allMsgs = sessionMessages.length > 0 ? sessionMessages : event.messages;
-    const conversationText = messagesToText(allMsgs);
-
-    // Use Hermes Agent's COMBINED_REVIEW_PROMPT
-    const reflectionPrompt = `${COMBINED_REVIEW_PROMPT}\n\n---\n\n${conversationText}`;
-
-    const piArgs = ["-p", reflectionPrompt, "--no-builtin-tools"];
-    if (config) piArgs.push(...buildProviderArgs(config));
-
-    try {
-      const result = await pi.exec("pi", piArgs, {
-        env: { ...process.env as any, PI_HINDSIGHT_SKIP_REFLECTION: "1" },
-      });
-
-      if (result.exitCode === 0 && result.stdout.trim()) {
-        const output = result.stdout.trim();
-
-        // Parse review actions from output
-        const actions = summarizeReviewActions(output);
-        if (actions.length > 0) {
-          const summary = actions.map((a) => a.summary).join(" \u00b7 ");
-          // Surface notification like Hermes does
-          if (summary) {
-            pi.sendMessage({
-              customType: "hindsight",
-              content: `\ud83d\udcbe Self-improvement review: ${summary}`,
-              display: "review",
-            });
-          }
-        }
-      }
-    } catch {
-      // reflection failed silently - not critical
+    if (sessionMessages.length === 0 && event.messages.length > 0) {
+      sessionMessages = event.messages;
     }
+    const conversationText = formatMessages(sessionMessages);
+    const prompt = buildReviewPrompt(conversationText);
+    fireReflection(pi, prompt);
   });
 
-  // ─── Register learn_pattern tool ───
+  // ─── learn_pattern tool ───
   pi.registerTool({
     name: "learn_pattern",
     description: "Save a reusable pattern learned from this session",
@@ -97,7 +118,7 @@ export function setupHandlers(pi: ExtensionAPI): void {
           description: "Category. Use 'preference' for user-stated preferences.",
         },
         detail: { type: "string", description: "Detailed description" },
-        tags: { type: "array", items: { type: "string" }, description: "Tags for categorization" },
+        tags: { type: "array", items: { type: "string" }, description: "Tags" },
       },
       required: ["summary", "type", "detail"],
     },
@@ -119,10 +140,10 @@ export function setupHandlers(pi: ExtensionAPI): void {
     },
   });
 
-  // ─── Register recall tool ───
+  // ─── recall tool ───
   pi.registerTool({
     name: "recall",
-    description: "Query past learned patterns relevant to current task",
+    description: "Query past learned patterns",
     parameters: {
       type: "object",
       properties: {
@@ -143,7 +164,7 @@ export function setupHandlers(pi: ExtensionAPI): void {
 
   // ─── Commands ───
   pi.registerCommand("hindsight", {
-    description: "Manage hindsight: /hindsight [list|stats|clear|path|config|prefer]",
+    description: "/hindsight [list|stats|clear|path|config|prefer]",
     handler: async (ctx) => {
       const args = (ctx.args ?? "").trim().split(/\s+/);
       const cmd = args[0] ?? "list";
@@ -151,79 +172,40 @@ export function setupHandlers(pi: ExtensionAPI): void {
       if (cmd === "stats") {
         const s = await getStats();
         const lines = Object.entries(s.byType).map(([t, c]) => `  ${t}: ${c}`).join("\n");
-        pi.sendMessage({
-          customType: "hindsight",
-          content: `Hindsight Stats\nMEMORY.md: ${s.memoryCount}\nUSER.md: ${s.userCount}\nTotal: ${s.total}\nAvg confidence: ${(s.avgConfidence * 100).toFixed(0)}%\n\n${lines}`,
-          display: "stats",
-        });
+        pi.sendMessage({ customType: "hindsight", content: `MEMORY.md: ${s.memoryCount}\nUSER.md: ${s.userCount}\nAvg conf: ${(s.avgConfidence * 100).toFixed(0)}%\n\n${lines}`, display: "stats" });
       } else if (cmd === "clear") {
         const { writeFile } = await import("node:fs/promises");
-        const { getMemoryPath } = await import("./memory.js");
         await writeFile(getMemoryPath(), "", "utf-8");
-        pi.sendMessage({ customType: "hindsight", content: "MEMORY.md cleared. USER.md left intact.", display: "clear" });
+        pi.sendMessage({ customType: "hindsight", content: "MEMORY.md cleared. USER.md intact.", display: "clear" });
       } else if (cmd === "path") {
-        pi.sendMessage({
-          customType: "hindsight",
-          content: `MEMORY.md: ${getMemoryPath()}\nUSER.md: ${getUserPath()}`,
-          display: "path",
-        });
+        pi.sendMessage({ customType: "hindsight", content: `MEMORY.md: ${getMemoryPath()}\nUSER.md: ${getUserPath()}`, display: "path" });
       } else if (cmd === "prefer") {
         const rest = args.slice(1).join(" ").trim();
-        if (!rest) {
-          pi.sendMessage({
-            customType: "hindsight",
-            content: "Usage: /hindsight prefer <your preference>\nExample: /hindsight prefer Always use nvm use 20 before npm install",
-            display: "help",
-          });
-          return;
-        }
+        if (!rest) { pi.sendMessage({ customType: "hindsight", content: "Usage: /hindsight prefer <text>", display: "help" }); return; }
         const { addUserPreference } = await import("./memory.js");
         await addUserPreference(rest, ["user-preference"]);
         pi.sendMessage({ customType: "hindsight", content: `Saved to USER.md: "${rest.slice(0, 120)}"`, display: "prefer" });
       } else if (cmd === "config") {
         if (!config) config = await loadConfig();
         const sub = args[1];
-        if (sub === "set-provider" && args[2]) {
-          config.provider = args[2]; await saveConfig(config);
-          pi.sendMessage({ customType: "hindsight", content: `Provider: ${args[2]}`, display: "config" });
-        } else if (sub === "set-model" && args[2]) {
-          config.model = args[2]; await saveConfig(config);
-          pi.sendMessage({ customType: "hindsight", content: `Model: ${args[2]}`, display: "config" });
-        } else if (sub === "toggle") {
-          config.autoReflect = !config.autoReflect; await saveConfig(config);
-          pi.sendMessage({ customType: "hindsight", content: `Auto-reflection: ${config.autoReflect ? "ON" : "OFF"}`, display: "config" });
-        } else {
-          pi.sendMessage({
-            customType: "hindsight",
-            content: `Config\nProvider: ${config.provider ?? "(default)"}\nModel: ${config.model ?? "(default)"}\nAuto-reflect: ${config.autoReflect}`,
-            display: "config",
-          });
-        }
+        if (sub === "set-provider" && args[2]) { config.provider = args[2]; await saveConfig(config); pi.sendMessage({ customType: "hindsight", content: `Provider: ${args[2]}`, display: "config" }); }
+        else if (sub === "set-model" && args[2]) { config.model = args[2]; await saveConfig(config); pi.sendMessage({ customType: "hindsight", content: `Model: ${args[2]}`, display: "config" }); }
+        else if (sub === "toggle") { config.autoReflect = !config.autoReflect; await saveConfig(config); pi.sendMessage({ customType: "hindsight", content: `Auto-reflection: ${config.autoReflect ? "ON" : "OFF"}`, display: "config" }); }
+        else { pi.sendMessage({ customType: "hindsight", content: `Provider: ${config.provider ?? "(default)"}\nModel: ${config.model ?? "(default)"}\nAuto-reflect: ${config.autoReflect}`, display: "config" }); }
       } else {
         const { all } = await loadAll();
-        if (all.length === 0) {
-          pi.sendMessage({
-            customType: "hindsight",
-            content: "No patterns yet. Commands: /hindsight stats, /hindsight path, /hindsight config, /hindsight prefer <text>",
-            display: "list",
-          });
-          return;
-        }
+        if (all.length === 0) { pi.sendMessage({ customType: "hindsight", content: "Empty. /hindsight prefer <text> to add.", display: "list" }); return; }
         const lines = all.slice(0, 15).map((e, i) => {
           const badge = e.userStated ? "[USER]" : `[${(e.confidence * 100).toFixed(0)}%]`;
           return `${i + 1}. ${badge} ${(e.body.split("\n")[0] ?? "").slice(0, 70)}`;
         });
-        pi.sendMessage({
-          customType: "hindsight",
-          content: `Hindsight (${all.length}: ${all.filter((e) => e.userStated).length} user, ${all.filter((e) => !e.userStated).length} learned)\n\n${lines.join("\n")}`,
-          display: "list",
-        });
+        pi.sendMessage({ customType: "hindsight", content: `${all.length} total (${all.filter((e) => e.userStated).length} user)\n\n${lines.join("\n")}`, display: "list" });
       }
     },
   });
 
   pi.registerCommand("forget", {
-    description: "Remove a pattern by ID or number: /forget <id|#>",
+    description: "/forget <id|#>",
     handler: async (ctx) => {
       const target = (ctx.args ?? "").trim();
       if (!target) { pi.sendMessage({ customType: "hindsight", content: "Usage: /forget <id> or /forget <#>", display: "help" }); return; }
@@ -232,8 +214,7 @@ export function setupHandlers(pi: ExtensionAPI): void {
       if (byId) { await deleteEntry(target); pi.sendMessage({ customType: "hindsight", content: `Forgotten: "${byId.summary.slice(0, 60)}"`, display: "forget" }); return; }
       const num = parseInt(target, 10);
       if (!isNaN(num) && num > 0 && num <= all.length) {
-        const e = all[num - 1]!;
-        await deleteEntry(e.id);
+        const e = all[num - 1]!; await deleteEntry(e.id);
         pi.sendMessage({ customType: "hindsight", content: `Forgotten: "${e.summary.slice(0, 60)}"`, display: "forget" });
         return;
       }
