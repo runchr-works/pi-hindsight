@@ -2,8 +2,10 @@
  * Markdown-based memory storage for pi-hindsight.
  *
  * Two-tier memory matching Hermes Agent:
- *   MEMORY.md  — LLM-learned patterns (confidence varies, curator cleans)
- *   USER.md    — User-stated preferences (confidence=1.0, permanent)
+ *   MEMORY.md  - LLM-learned patterns (confidence varies)
+ *   USER.md    - User-stated preferences (confidence=1.0, permanent)
+ *
+ * Review prompts ported from Hermes Agent background_review.py (MIT license).
  */
 
 import { readFile, writeFile, mkdir } from "node:fs/promises";
@@ -28,7 +30,6 @@ export interface MemoryEntry {
   createdAt: string;
   lastApplied: string | null;
   source: string;
-  /** true if from USER.md — user-stated, never auto-cleaned */
   userStated: boolean;
 }
 
@@ -40,6 +41,65 @@ export interface MemoryStats {
   avgConfidence: number;
   highestConfidence: number;
 }
+
+// ---------------------------------------------------------------------------
+// Hermes Agent Review Prompts (ported from background_review.py, MIT license)
+// ---------------------------------------------------------------------------
+
+export const MEMORY_REVIEW_PROMPT = `Review the conversation above and consider saving to memory if appropriate.
+
+Focus on:
+1. Has the user revealed things about themselves - their persona, desires, preferences, or personal details worth remembering?
+2. Has the user expressed expectations about how you should behave, their work style, or ways they want you to operate?
+
+If something stands out, save it using the learn_pattern tool (use type=preference for user preferences).
+If nothing is worth saving, just say the word STOP.`;
+
+export const SKILL_REVIEW_PROMPT = `Review the conversation above and update the memory. Be ACTIVE - most sessions produce at least one update. A pass that does nothing is a missed learning opportunity, not a neutral outcome.
+
+Signals to look for (any one warrants action):
+  - User corrected your style, tone, format, or approach.
+  - Non-trivial technique, fix, workaround, or debugging pattern emerged.
+  - A previously learned pattern turned out wrong or outdated.
+
+Preference order:
+  1. Save a pattern using learn_pattern tool
+  2. Update an existing pattern (same type + similar summary)
+
+User-preference embedding: when the user expressed a style/format/workflow preference, save it as type=preference so it goes to USER.md.
+
+Do NOT capture:
+  - Environment-dependent failures (missing binaries, fresh-install errors)
+  - Negative claims about tools or features that are temporary
+  - Session-specific transient errors that resolved
+  - One-off task narratives
+
+If nothing is worth saving, just say the word STOP.`;
+
+export const COMBINED_REVIEW_PROMPT = `Review the conversation above and update two things:
+
+**Memory**: who the user is. Did the user reveal persona, desires, preferences, personal details, or expectations about how you should behave? Save facts about the user with learn_pattern (type=preference).
+
+**Patterns**: what was learned. Be ACTIVE - most sessions produce at least one pattern worth saving.
+
+Signals that warrant saving:
+  - User corrected your style, tone, format, or approach.
+  - Non-trivial technique, fix, workaround, or debugging path emerged.
+  - A previously saved pattern turned out wrong or outdated - update it.
+
+Preference order:
+  1. Save a pattern using learn_pattern tool
+  2. Update an existing pattern
+
+User-preference embedding: when the user complains about how you handled a task, save it as type=preference in USER.md.
+
+Do NOT capture:
+  - Environment-dependent failures
+  - Negative claims about tools or features
+  - Session-specific transient errors
+  - One-off task narratives
+
+Act on whichever dimension has real signal. If genuinely nothing stands out, just say the word STOP.`;
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -133,7 +193,6 @@ async function readEntries(path: string): Promise<MemoryEntry[]> {
 async function writeEntries(path: string, entries: MemoryEntry[]): Promise<void> {
   const dir = getStoreDir();
   if (!existsSync(dir)) await mkdir(dir, { recursive: true });
-  // USER.md stores userStated=false entries too for simplicity
   const content = entries.map((e) => serializeEntry(e, true)).join("\n") + "\n";
   await writeFile(path, content, "utf-8");
 }
@@ -149,11 +208,7 @@ export async function loadAll(): Promise<{
 }> {
   const memory = await readEntries(getMemoryPath());
   const user = await readEntries(getUserPath());
-  return {
-    memory,
-    user,
-    all: [...user, ...memory],
-  };
+  return { memory, user, all: [...user, ...memory] };
 }
 
 export async function saveMemoryEntry(entry: MemoryEntry): Promise<void> {
@@ -161,27 +216,26 @@ export async function saveMemoryEntry(entry: MemoryEntry): Promise<void> {
   if (entry.userStated) {
     user.push(entry);
     await writeEntries(getUserPath(), user);
-  } else {
-    // Deduplicate by type + first line
-    const first = entry.body.split("\n")[0]?.trim().toLowerCase() ?? "";
-    const idx = memory.findIndex(
-      (e) => !e.userStated && e.type === entry.type && e.body.split("\n")[0]?.trim().toLowerCase() === first,
-    );
-    if (idx >= 0) {
-      const cur = memory[idx]!;
-      if (entry.confidence > cur.confidence) cur.confidence = entry.confidence;
-      cur.successCount += entry.successCount;
-      cur.failCount += entry.failCount;
-      cur.lastApplied = new Date().toISOString();
-      if (entry.body.length > cur.body.length) cur.body = entry.body;
-      memory[idx] = cur;
-    } else {
-      memory.push(entry);
-    }
-    memory.sort((a, b) => b.confidence - a.confidence || b.createdAt.localeCompare(a.createdAt));
-    if (memory.length > 100) memory.splice(100);
-    await writeEntries(getMemoryPath(), memory);
+    return;
   }
+  const first = entry.body.split("\n")[0]?.trim().toLowerCase() ?? "";
+  const idx = memory.findIndex(
+    (e) => !e.userStated && e.type === entry.type && e.body.split("\n")[0]?.trim().toLowerCase() === first,
+  );
+  if (idx >= 0) {
+    const cur = memory[idx]!;
+    if (entry.confidence > cur.confidence) cur.confidence = entry.confidence;
+    cur.successCount += entry.successCount;
+    cur.failCount += entry.failCount;
+    cur.lastApplied = new Date().toISOString();
+    if (entry.body.length > cur.body.length) cur.body = entry.body;
+    memory[idx] = cur;
+  } else {
+    memory.push(entry);
+  }
+  memory.sort((a, b) => b.confidence - a.confidence || b.createdAt.localeCompare(a.createdAt));
+  if (memory.length > 100) memory.splice(100);
+  await writeEntries(getMemoryPath(), memory);
 }
 
 export async function queryRelevant(context: string, minConfidence = 0.3): Promise<MemoryEntry[]> {
@@ -206,9 +260,7 @@ export async function getStats(): Promise<MemoryStats> {
     if (e.confidence > highest) highest = e.confidence;
   }
   return {
-    total: all.length,
-    memoryCount: memory.length,
-    userCount: user.length,
+    total: all.length, memoryCount: memory.length, userCount: user.length,
     byType,
     avgConfidence: all.length > 0 ? totalConf / all.length : 0,
     highestConfidence: highest,
@@ -220,8 +272,7 @@ export async function addUserPreference(body: string, tags: string[]): Promise<M
     id: `user_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
     type: "preference",
     summary: body.split("\n")[0]?.slice(0, 120) ?? body.slice(0, 120),
-    body,
-    tags,
+    body, tags,
     confidence: 1.0,
     successCount: 0, failCount: 0, context: "",
     createdAt: new Date().toISOString(),
@@ -256,7 +307,6 @@ export async function deleteEntry(id: string): Promise<boolean> {
 
 export function formatAsPrompt(entries: MemoryEntry[], max = 5): string {
   if (entries.length === 0) return "";
-  // User preferences first, then by confidence
   const sorted = [...entries].sort((a, b) => {
     if (a.userStated && !b.userStated) return -1;
     if (!a.userStated && b.userStated) return 1;
@@ -278,18 +328,46 @@ export function formatAsPrompt(entries: MemoryEntry[], max = 5): string {
   ].join("\n");
 }
 
-export function buildReflectionPrompt(summary: string): string {
-  return `You are a self-improvement reviewer. Analyze the following conversation turn.
+// ---------------------------------------------------------------------------
+// Background review output parser (ported from Hermes summarize_background_review_actions)
+// ---------------------------------------------------------------------------
 
-${summary}
+export interface ReviewAction {
+  tool: string;
+  action: string;
+  target: string;
+  summary: string;
+}
 
-Review criteria:
-- Effective strategy or workflow worth remembering? \u2192 call \`learn_pattern\`
-- Mistake or anti-pattern to avoid? \u2192 call \`learn_pattern\`
-- User stated a clear preference? \u2192 also call \`learn_pattern\` with type=preference
-- Nothing notable? \u2192 do nothing
-
-Be selective. Only save high-value, reusable patterns.
-
-IMPORTANT: If the user explicitly stated a preference (\"I always do X\", \"Use Y not Z\", etc.), save it as type=preference so it goes to USER.md automatically.`;
+export function summarizeReviewActions(
+  reviewOutput: string,
+): ReviewAction[] {
+  const actions: ReviewAction[] = [];
+  const lines = reviewOutput.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    // Look for learn_pattern tool call results
+    if (trimmed.startsWith("Learned:") || trimmed.startsWith("learn_pattern")) {
+      actions.push({
+        tool: "learn_pattern",
+        action: "created",
+        target: "memory",
+        summary: trimmed.replace(/^(Learned:|learn_pattern)/, "").trim().slice(0, 80),
+      });
+    }
+    // Look for recall results
+    if (trimmed.startsWith("Found pattern") || trimmed.startsWith("recall result")) {
+      actions.push({
+        tool: "recall",
+        action: "queried",
+        target: "memory",
+        summary: trimmed.slice(0, 80),
+      });
+    }
+    // Detect STOP signal
+    if (trimmed === "STOP" || trimmed === "Nothing to save.") {
+      return actions; // Nothing saved
+    }
+  }
+  return actions;
 }
