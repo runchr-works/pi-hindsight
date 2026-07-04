@@ -33,6 +33,9 @@ set a specific provider/model for reflection (cheaper model recommended):
 cd pi-hindsight
 npm install && npm run build
 pi install /path/to/pi-hindsight
+
+# Or from GitHub
+pi install git:github.com/runchr-works/pi-hindsight
 ```
 
 ## Storage
