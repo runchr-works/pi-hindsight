@@ -1,0 +1,30 @@
+{
+  "name": "pi-hindsight",
+  "version": "0.1.0",
+  "description": "Self-learning extension for Pi coding agent. Learns from past sessions and injects lessons into future prompts.",
+  "type": "module",
+  "main": "dist/index.js",
+  "pi": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "pi",
+    "extension",
+    "self-learning",
+    "hindsight",
+    "memory"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "typescript": "^5.4.0"
+  }
+}
